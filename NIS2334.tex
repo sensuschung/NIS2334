@@ -1,0 +1,469 @@
+\documentclass[11pt, a4paper, oneside,UTF8]{ctexart}
+\usepackage{amsmath,array, amsthm, amssymb, appendix, bm, graphicx, mathrsfs,subcaption,booktabs,tabularx,listings,xcolor,titling,fancyhdr,fontspec,lipsum,titlesec}
+\usepackage[hidelinks]{hyperref}
+\usepackage[a4paper]{geometry}
+\usepackage{enumitem,lastpage}
+
+% 设置页边距
+\geometry{left=20mm,right=20mm,top=20mm,bottom=20mm}
+
+% 设置页眉
+\pagestyle{fancy}
+\fancyhf{} % 清除当前设置的页眉和页脚
+\cfoot{Page \thepage\ of \pageref{LastPage}} % 在页脚中间显示页码
+\renewcommand{\headrulewidth}{0mm} % 设置页眉的分隔线粗细
+\renewcommand{\footrulewidth}{0.1mm} % 设置页脚的分隔线粗细
+
+% 设置 Fira Mono 字体
+\setmonofont{Fira Mono}[Scale=0.8]
+
+\title{\textbf{NIS2334实验报告}\\ \large \textbf{实验二必做 + 实验二选做}}
+\setlength{\droptitle}{-2cm}
+\author{赶大作业悲伤人士}
+\date{}%
+\linespread{1.5}
+\newtheorem{theorem}{定理}[section]
+\newtheorem{definition}[theorem]{定义}
+\newtheorem{lemma}[theorem]{引理}
+\newtheorem{corollary}[theorem]{推论}
+\newtheorem{example}[theorem]{例}
+\newtheorem{proposition}[theorem]{命题}
+\renewcommand{\abstractname}{\Large\textbf{摘要}}
+\pagestyle{plain}%
+
+% 自定义标题格式
+\titleformat{\section}[hang]{\normalfont\Large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}[hang]{\normalfont\large\bfseries}{\thesubsection}{1em}{}
+\titleformat{\subsubsection}[hang]{\normalfont\normalsize\bfseries}{\thesubsubsection}{1em}{}
+
+\definecolor{lightgray}{HTML}{EEEEEE}
+\definecolor{darkgreen}{HTML}{4CAF50}
+\lstset{
+    language=C, % 设置语言为C
+    backgroundcolor=\color{lightgray}, % 设置背景颜色
+    basicstyle=\ttfamily\fontsize{10}{10}\selectfont, % 设置基本字体大小
+    breaklines=true, % 自动断行
+    showstringspaces=false, % 不显示字符串中的空格
+    commentstyle=\color{darkgreen}, % 设置注释的颜色
+    keywordstyle=\color{blue} % 设置关键字的颜色
+}
+
+\begin{document}
+\setcounter{page}{1}
+
+\maketitle
+\vspace{-\baselineskip}
+\thispagestyle{fancy}
+
+\section{\textbf{实验二必做}}
+
+\subsection{概述}
+openEuler系统采取LRU算法进行页面淘汰，其LRU算法的实现主要是基于一对双向列表，active list和inactive list，其中较活跃页面放在active list上，不活跃页面放在inactive list。在内存严重不足或kswaped扫描出操作系统内存低于阈值时，内核会开始页面回收，通过扫描器和一系列检查、准备操作做，从inactive list尾部回收页面。LRU回收方法主要有快速内存回收、直接内存回收和kswaped内存回收三种。
+
+\subsection{数据结构}
+\subsubsection{扫描器结构体}
+主要由scan\_control结构体用于控制和调整页面回收过程的参数和信息，部分数据项如下：
+\begin{lstlisting}
+// mm\vmscan.c
+  struct scan_control {
+      unsigned long nr_to_reclaim;//控制总回收页框数
+
+      // 控制匿名页lru和文件页lru链表的扫描平衡
+      unsigned long   anon_cost;
+      unsigned long   file_cost;
+
+      unsigned int may_writepage:1;// 是否回写
+      unsigned int may_unmap:1;
+      unsigned int may_swap:1; //是否将匿名页放入swap区
+
+      s8 priority;//每次扫描页框数  
+      unsigned long nr_scanned;// 已经扫描的页框数
+      unsigned long nr_reclaimed;// 已经回收的页框数
+      };
+\end{lstlisting}
+其中三个标识符分别控制：
+\begin{enumerate}
+    \setlength{\itemsep}{-0.5em}
+    \item writepage :记录是否可以回写到磁盘。若不能，则不能处理脏页（数据需要写回同步）或匿名页（没有对应文件数据）
+    \item unmap :是否可以进行解除映射操作。若不能，则只能处理非映射页。
+    \item swap : 是否可以写入swap分区。若不能，则不能处理已使用的匿名页。
+\end{enumerate}
+\subsubsection{LRU基本内存结构}
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.9\textwidth]{./figure/1.1.png}
+    \caption{部分结构示例图}
+    \label{figure:1.1}
+\end{figure}
+
+如图1所示，pglist\_data用于存储页面列表信息，lruvec结构用于存储lru列表信息，其中lists[NR\_LRU\_LISTS]为5个lru列表的头结点，5个lru列表的定义如下。
+\begin{lstlisting}
+  enum lru_list {
+      LRU_INACTIVE_ANON = LRU_BASE,
+      LRU_ACTIVE_ANON = LRU_BASE + LRU_ACTIVE,
+      LRU_INACTIVE_FILE = LRU_BASE + LRU_FILE,
+      LRU_ACTIVE_FILE = LRU_BASE + LRU_FILE + LRU_ACTIVE,
+      LRU_UNEVICTABLE,
+      NR_LRU_LISTS
+  };
+\end{lstlisting}
+在后续对page的操作中，只要获取目标页面的Active/InActive和File/Anon值，就可以定位到目标lru列表。
+
+每一个lru链表头结点都链接了page结构链表。page结构存储单个页面，是页面回收的基本操作单位，主要分为文件页（对应磁盘文件读到memory后暂存的页）和匿名页（没有文件背景的内存，存储如stack，heap等数据）。page结构中重要的数据项有：
+\begin{lstlisting}
+  struct page{
+      unsigned long flags; //页面状态，用于异步更新
+      union{
+          struct{
+              struct list_head lru;//所在lru列表头
+              ...
+          };
+          ...
+      }
+  }
+\end{lstlisting}
+其中与LRU算法相关的flags状态有：
+\begin{itemize}
+  \setlength{\itemsep}{-0.5em}
+  \item PG\_active:页活跃标志
+  \item PG\_referenced: 页是否被引用
+  \item PG\_lru: 页是否在lru链表中
+  \item PG\_mlocked:页是否被内存锁定
+  \item PG\_swapbacked:页是否依赖swap
+\end{itemize}
+
+\subsubsection{LRU操作结构}
+
+为了更细粒度地控制自旋锁范围、更高效地进行页面操作，openEuler在"include$\backslash$linux$\backslash$pagevec.h"中定义了pagevec结构体来缓存一定数量的page，并进一步定义了lru\_rotate和lru\_pvecs作为lru链表操作对应的页面缓存集。其主要定义如下。
+
+\begin{lstlisting}
+  #define PAGEVEC_SIZE 15
+  struct pagevec {
+      unsigned char nr;// 当前page数量
+      struct page *pages[PAGEVEC_SIZE];
+  };
+
+  struct lru_rotate {
+      local_lock_t lock;
+      struct pagevec pvec;
+  };
+
+  struct lru_pvecs {
+      local_lock_t lock;
+      struct pagevec lru_add;//添加到lru列表
+      struct pagevec lru_deactivate_file;// 文件页：从活动列表移动到非活动列表
+      struct pagevec lru_deactivate;//从活动列表移动到非活动列表
+      struct pagevec lru_lazyfree;//匿名页：从活动列表移动到非活动列表
+    #ifdef CONFIG_SMP //SMP机器操作
+      // 将非活动页移动到活动页的缓存
+      struct pagevec activate_page;
+    #endif
+  };
+
+\end{lstlisting}
+
+当需要对lru链表进行操作时，page将被加到对于操作的缓存集中，在缓存集满或者其他适当的时候将缓存集中的页面进行一次性处理操作。
+
+\subsection{算法流程与函数}
+
+整个算法流程可以分为局部的LRU操作实现、整体内存回收实现和不同内存回收方法的实现三部分。
+
+\subsubsection{LRU链表操作缓存函数}
+
+LRU主要的函数操作在表1中列出。
+
+其中deactivate\_file\_page和deactivate\_page处理没有被进程映射的页面，而ake\_page\_lazyfree函数处理正在回写到swap分区的匿名页，rotate\_reclaimable\_page将写回的页面加入列表尾部。以上四个函数都针对页面属性进行了回收优化，通过控制写回inactive页面的头部/尾部来延迟/加快不同属性页面的回收。
+
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{|c|c|c|}
+      \toprule
+      lru操作缓存列表& 主要函数 & 作用 \\
+      \midrule
+      lru\_add&lru\_cache\_add & 将cpu中的页面缓存添加至lru列表\\ 
+      lru\_deactivate\_file& deactivate\_file\_page& 将不经常访问文件页从active列表添加到inactive列表 \\
+      lru\_deactivate & deactivate\_page &将不经常访问页面从active列表添加到inactive列表\\
+      lru\_lazyfree & make\_page\_lazyfree &将不经常访问匿名页从active列表添加到inactive列表\\
+      lru\_rotate & rotate\_reclaimable\_page &将回写完的页面加入inactive列表尾部\\
+      \bottomrule
+  \end{tabular}
+  \caption{lru列表操作主要函数}
+  \label{tab:1.1}
+\end{table}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.8\textwidth]{./figure/1.2.png}
+  \caption{lru\_cache\_add\ callmap}
+  \label{figure:1.2}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.8\textwidth]{./figure/1.3.png}
+  \caption{deactivate\_file\_page callmap}
+  \label{figure:1.3}
+\end{figure}
+
+
+图2-3 为表中函数部分函数\footnotemark 的callmap与注解。观察函数调用过程，可以发现其基本过程可以分为两种：
+
+\begin{enumerate}
+  \setlength{\itemsep}{-0.5em}
+  \item 获取page->加入对应pagevec ->若满，则直接调用add/move函数
+  \item 获取page->加入对应pagevec ->若满，则调用move\_fn，控制不同函数参数，对pagevec上的页面做对应操作（在此处为从原列表上删除，加入新列表）
+\end{enumerate}
+\footnotetext{由于deactivate\_page、mark\_page\_lazyfree函数和deactivate\_file\_page函数基本调用流程和操作相似，\\rotate\_reclaimable\_page函数和pagevec\_add函数基本调用流程和操作相似,将不绘制deactivate\_page函数、\\mark\_page\_lazyfree函数和pagevec\_add函数的callMap。}
+
+除此以外，与LRU算法相关的重要函数还有mark\_page\_accessed。为了更精细地控制active列表和inactive列表上页面的转移，该系统设置了四种状态：
+\begin{itemize}
+  \setlength{\itemsep}{-0.5em}
+  \item inactive,unreferenced
+  \item inactive,referenced
+  \item activate,unreferenced
+  \item activate,referenced
+\end{itemize}
+mark\_page\_accessed就是用于控制页面状态转换的函数。
+
+\subsubsection{页面回收函数}
+主要定义在vmscan.c中，整体函数依赖关系如图4所示。
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=1\textwidth]{./figure/2.0.png}
+  \caption{lru\_cache\_add\ callmap}
+  \label{figure:2.0}
+\end{figure}
+
+核心函数为\textbf{shrink\_node}。该函数基本原理如图5所示。
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.9\textwidth]{./figure/2.1.png}
+  \caption{lru\_cache\_add\ callmap}
+  \label{figure:2.1}
+\end{figure}
+
+可以看出shrink\_node函数会在运行过程中进行node\_memcgs和slab内存的循环回收，每一次回收前后都会进行准备和优化过程，完成后会判断回收是否结束。
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.9\textwidth]{./figure/2.2.png}
+  \caption{shrink\_node\_memcgs \& shrink\_list callmap}
+  \label{figure:2.2}
+\end{figure}
+\textbf{shrink\_node\_memcgs}函数用于回收node中的lru。其主要代码段为：
+\begin{lstlisting}
+  static void shrink_node_memcg(struct pglist_data *pgdat, struct mem_cgroup *memcg,struct scan_control *sc, unsigned long *lru_pages)
+  {
+      ...
+      while (nr[LRU_INACTIVE_ANON] || nr[LRU_ACTIVE_FILE] ||nr[LRU_INACTIVE_FILE]){
+          for_each_evictable_lru(lru){
+            \dots
+            nr_reclaimed += shrink_list(lru, nr_to_scan,lruvec, sc);
+          }
+          \dots/* 调整文件页和匿名页比例的代码 */
+      }
+      \dots
+      if (inactive_list_is_low(lruvec, false, sc, true)){
+          shrink_active_list(SWAP_CLUSTER_MAX, lruvec,sc, LRU_ACTIVE_ANON);
+      }
+  }
+\end{lstlisting}
+可以看出该函数会先不断循环，执行shrink\_list函数来回收页面并调整文件页和匿名页比例，直至回收目标完成或目标无法达到，退出循环后，若inactive列表页面过少\footnotemark，则会执行shrink\_active\_list进行平衡。
+
+\textbf{shrink\_list}函数用于回收或调整lru列表中的页面。
+
+若lru参数为active\_list，则执行shrink\_active\_list调整列表平衡；若lru参数为inactive\_list，则执行shrink\_inactive\_list进行非活跃页面的回收。
+
+\footnotetext{在页面回收过程中，active列表与inactive列表的比例需要尽可能接近3:1（由函数inactive\_list\_is\_low判定）}
+
+\textbf{shrink\_active\_list}函数用于缩减active列表中的页面数量，从图7可以看出，该函数会从active列表尾开始筛选一定数量当前回收区中、可正常获取的页面，放入l\_hold列表作为候选，随后会选择匿名页或非缓存执行代码的文件页，将其从active了列表放入inactive列表。
+
+\textbf{shrink\_inactive\_list}函数用于回收inactive列表中的页面，主要调用shrink\_page\_list和free\_undef\_page\_list函数实现。
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=0.9\textwidth]{./figure/2.3.png}
+  \caption{shrink\_active\_list流程图}
+  \label{figure:2.3}
+\end{figure}
+
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=0.9\textwidth]{./figure/2.4.png}
+  \caption{shrink\_inactive\_list流程图}
+  \label{figure:2.4}
+\end{figure}
+
+\textbf{shrink\_page\_list}函数用于遍历页面列表，尝试释放页面进行回收。由图9可得，该函数会检查：
+
+\begin{itemize}
+  \setlength{\itemsep}{-0.5em}
+  \item 页是否可回收
+  \item 页的状态，包括是否脏、是否在写回等
+  \item 页的引用情况
+  \item 页的类型
+\end{itemize}
+根据检查结果决定是否激活页、保留页、回收页或执行其他操作，如取消映射、释放缓冲区等。\\
+
+
+页面回收的主要入口点有：\textbf{do\_try\_to\_free\_pages}和\textbf{do\_swapcache\_reclaim}。
+
+前一个为直接回收页面的主要函数，会调用shrink\_zones（其中会进一步调用shrink\_node）来进行页面回收。后一个为回收交换缓存页面的主要入口点，会调用reclaim\_swapcache\_pages\_from\_list（其中会进一步调用shrink\_page\_list）实现页面回收。
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=0.9\textwidth]{./figure/2.5.png}
+  \caption{shrink\_page\_list流程图}
+  \label{figure:2.5}
+\end{figure}
+
+\subsubsection{三种回收方式}
+
+在该操作系统中，一共有三种页面回收方法：快速内存回收、直接内存回收和kswaped线程回收。后两种方式由操作系统的内存状态（内存使用率）控制。
+
+在操作系统中定义了三个水位线：pages\_high，pages\_low和pages\_min。pages\_high表示当前操作系统内存状态是良好的，此时kswaped线程处于sleep状态。当内存使用率触及pages\_low，就意味着内存不足，操作系统会开始内存回收，由进程kswaped周期性检查并回收内存。当内存使用率触及pages\_min，即内存严重不足，操作系统会开始直接内存回收。
+
+\subsection{实验实现}
+
+实验目的：记录每次发生页面淘汰时淘汰的页面
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=0.9\textwidth]{./figure/3.1.png}
+  \caption{代码修改：添加页面淘汰信息}
+  \label{figure:3.1}
+\end{figure}
+
+\subsubsection{解决思路}
+操作系统中的页面有唯一标志符pfn，为页面在mem\_map结构中的下标。因此，只需找到页面淘汰的底层释放函数，添加淘汰页面的信息至系统日志。
+
+页面淘汰底层函数为mm/page\_alloc.c/\_\_free\_one\_page。该函数在成功释放页面之后增加空闲页面的计数，因此修改代码，将释放信息函数写于更新计数代码行前，如图10所示。
+
+其中print\_info函数用于将信息输出到log中，输出文件为/proc/kmsg。
+
+\subsubsection{实验结果}
+
+打开/proc/kmsg文件，看到文件中成功输出了回收页面的pfn信息，则实验成功。
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=0.9\textwidth]{./figure/3.2.png}
+  \caption{必做实验结果图}
+  \label{figure:3.2}
+\end{figure}
+
+\section{\textbf{实验二选做}}
+
+\subsection{基本目标与思路}
+实验目标为设计数据结构，实现FIFO算法。设最大缓存页面数为10，并采用数组记录页面，在每一次分配新页面的时候检查数组，若数组已满，则输出最先分配页面的pfn值，并将当前新页面入队。
+
+\subsection{具体实现}
+首先，在page\_alloc.c中定义存储FIFO的数组结构。count为数组中元素个数，front和rear为头尾元素索引值，lock为自旋锁，使得数组内容能在临界区内被修改。
+\begin{lstlisting}
+  //define the struct of FIFO
+  #define FIFO_size 10
+  typedef struct {
+      unsigned long array[FIFO_size];
+      int front;
+      int rear;
+      int count;
+    spinlock_t lock;
+  } FIFO;
+
+  static FIFO fifo;  //Define global array variables
+\end{lstlisting}
+
+其次，实现该数组的init函数，并且在page\_alloc初始化时初始化数组，其中page\_alloc\_init为cpu加载时page\_alloc的初始化函数，因此对其作一行修改。
+\begin{lstlisting}
+  static void initFIFO(FIFO *fifo) {
+    fifo->front = 0;
+    fifo->rear = -1;
+    fifo->count = 0;
+	  spin_lock_init(&fifo->lock);//built-in init function in Linux
+  }
+
+  void __init page_alloc_init(void)
+  {
+    int ret;
+    initFIFO(&fifo); //Modified here.Init FIFO array
+    ret = cpuhp_setup_state_nocalls(CPUHP_PAGE_ALLOC_DEAD,
+            "mm/page_alloc:dead", NULL,
+            page_alloc_cpu_dead);
+    WARN_ON(ret < 0);
+  }
+\end{lstlisting}
+
+考虑到实验目标，则只需实现队列的入队，并且在队列满时出队即可，则定义enqueue函数如下。在页面入队/出队时，会调用printk函数，将相关内核信息输出至系统日志中。为调试方便，此处将消息等级处理为KERN\_DEBUG。
+
+\begin{lstlisting}
+  static bool isFull(FIFO *fifo) {
+    return fifo->count == FIFO_size;
+  }
+
+  //add pfn of the new_page to the tail of the queue
+  static void enqueue(FIFO *fifo,unsigned long pfn) {
+    unsigned long flags;
+    //enter critical
+    spin_lock_irqsave(&fifo->lock, flags); 
+    //check if the queue is full
+    if (isFull(fifo)) {
+      unsigned long removed_value = fifo->array[fifo->front];
+      //print dequeue information
+      printk(KERN_DEBUG "Dequeued FIFO_page,whose pfn is %lu\n", removed_value);
+      fifo->front = (fifo->front + 1) % FIFO_size;
+          fifo->count--;
+    }
+    //new page enqueue
+    fifo->rear = (fifo->rear + 1) % FIFO_size;
+    fifo->array[fifo->rear] = pfn;
+    fifo->count++;
+    //exit critical
+    spin_unlock_irqrestore(&fifo->lock, flags);
+    //print enqueue information
+    printk(KERN_DEBUG "add FIFO_page ,whose pfn is %lu\n",pfn);
+  }
+\end{lstlisting}
+
+最后，由于分配新页面时调用底层函数为get\_page\_from\_freelist，则只需在该函数成功获取页面并准备返回时调用enqueue函数即可，具体修改如下：
+\begin{lstlisting}
+  static struct page *
+  get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
+              const struct alloc_context *ac)
+  {
+    \dots
+    try_this_zone://label line of getting free page
+		page = rmqueue(ac->preferred_zoneref->zone, zone, order,
+				gfp_mask, alloc_flags, ac->migratetype);
+		if (page) {
+			prep_new_page(page, order, gfp_mask, alloc_flags);
+
+			/*
+			 * If this is a high-order atomic allocation then check
+			 * if the pageblock should be reserved for the future
+			 */
+			if (unlikely(order && (alloc_flags & ALLOC_HARDER)))
+				reserve_highatomic_pageblock(page, zone, order);
+      //Modified here:get pfn of the page and add pfn to array if getting page correctly
+			if(page) enqueue(&fifo,page_to_pfn(page));
+			return page;
+		}
+    \dots
+  }
+\end{lstlisting}
+
+\subsection{实验结果}
+成功编译并替换内核后，切换到4.19.0内核，并且在终端中输入\texttt{dmesg | grep "Dequeued" | head -n 30}获取最开始的30条输出信息（过滤入队消息）。
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=0.8\textwidth]{./figure/3.3.png}
+  \caption{选做实验结果图}
+  \label{figure:3.3}
+\end{figure}
+
+\end{document}
+
+
+
+
