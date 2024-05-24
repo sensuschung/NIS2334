@@ -1,4 +1,4 @@
-# NIS2336
+# NIS2334
 The code and report for the course assignment.
 
 - 实验二.pdf/实验三.pdf：实验要求
